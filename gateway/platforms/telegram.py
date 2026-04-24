@@ -327,6 +327,37 @@ class TelegramAdapter(BasePlatformAdapter):
             return default
         return bool(value)
 
+    def _configured_command_menu_groups(self) -> list[tuple[str | None, list[tuple[str, str]]]]:
+        """Return operator-configured Telegram command menu entries grouped by chat scope."""
+
+        raw_items = self.config.extra.get("command_menu", []) if getattr(self.config, "extra", None) else None
+        if not isinstance(raw_items, list):
+            return []
+
+        grouped: dict[str | None, list[tuple[str, str]]] = {}
+        seen: dict[str | None, set[str]] = {}
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            command = str(item.get("command") or "").strip().lstrip("/").lower()
+            description = str(item.get("description") or "").strip()
+            scope_chat_id = item.get("scope_chat_id")
+            scope_key = str(scope_chat_id).strip() if scope_chat_id not in (None, "") else None
+
+            if not re.fullmatch(r"[a-z0-9_]{1,32}", command):
+                continue
+            if not description:
+                continue
+            description = description[:256]
+
+            names_for_scope = seen.setdefault(scope_key, set())
+            if command in names_for_scope:
+                continue
+            names_for_scope.add(command)
+            grouped.setdefault(scope_key, []).append((command, description))
+
+        return [(scope, commands) for scope, commands in grouped.items() if commands]
+
     def _link_preview_kwargs(self) -> Dict[str, Any]:
         if not getattr(self, "_disable_link_previews", False):
             return {}
@@ -867,7 +898,7 @@ class TelegramAdapter(BasePlatformAdapter):
             # List is derived from the central COMMAND_REGISTRY — adding a new
             # gateway command there automatically adds it to the Telegram menu.
             try:
-                from telegram import BotCommand
+                from telegram import BotCommand, BotCommandScopeChat
                 from hermes_cli.commands import telegram_menu_commands
                 # Telegram allows up to 100 commands but has an undocumented
                 # payload size limit.  Skill descriptions are truncated to 40
@@ -880,6 +911,32 @@ class TelegramAdapter(BasePlatformAdapter):
                     logger.info(
                         "[%s] Telegram menu: %d commands registered, %d hidden (over 100 limit). Use /commands for full list.",
                         self.name, len(menu_commands), hidden_count,
+                    )
+
+                for scope_chat_id, configured_commands in self._configured_command_menu_groups():
+                    configured_names = {name for name, _desc in configured_commands}
+                    scoped_commands = configured_commands + [
+                        (name, desc)
+                        for name, desc in menu_commands
+                        if name not in configured_names
+                    ]
+                    scoped_commands = scoped_commands[:100]
+                    kwargs = {}
+                    scope_label = "global"
+                    if scope_chat_id:
+                        chat_id = int(scope_chat_id) if scope_chat_id.lstrip("-").isdigit() else scope_chat_id
+                        kwargs["scope"] = BotCommandScopeChat(chat_id=chat_id)
+                        scope_label = f"chat:{scope_chat_id}"
+                    await self._bot.set_my_commands(
+                        [BotCommand(name, desc) for name, desc in scoped_commands],
+                        **kwargs,
+                    )
+                    logger.info(
+                        "[%s] Telegram menu: %d configured command(s), %d total command(s) registered for %s.",
+                        self.name,
+                        len(configured_commands),
+                        len(scoped_commands),
+                        scope_label,
                     )
             except Exception as e:
                 logger.warning(

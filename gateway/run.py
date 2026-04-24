@@ -1048,7 +1048,7 @@ class GatewayRunner:
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
         )
 
-    async def _emit_message_observed(self, event: MessageEvent, source: SessionSource) -> None:
+    async def _emit_message_observed(self, event: MessageEvent, source: SessionSource) -> List[Any]:
         """Emit a generic pre-auth inbound message observation hook."""
         raw_message = getattr(event, "raw_message", None)
         chat = getattr(raw_message, "chat", None)
@@ -1101,13 +1101,61 @@ class GatewayRunner:
         }
 
         hooks = getattr(self, "hooks", None)
+        emit_collect = getattr(hooks, "emit_collect", None)
+        if callable(emit_collect):
+            try:
+                return await emit_collect("message:observed", payload)
+            except Exception as exc:
+                logger.debug("message:observed hook emit failed: %s", exc)
+                return []
+
         emit = getattr(hooks, "emit", None)
         if not callable(emit):
-            return
+            return []
         try:
             await emit("message:observed", payload)
         except Exception as exc:
             logger.debug("message:observed hook emit failed: %s", exc)
+        return []
+
+    async def _apply_observed_hook_decisions(
+        self,
+        event: MessageEvent,
+        source: SessionSource,
+        hook_results: List[Any],
+    ) -> tuple[bool, bool]:
+        """Apply generic pre-auth hook decisions.
+
+        Supported dict return values:
+        - {"action": "allow"}: continue dispatch as authorized.
+        - {"action": "reply", "text": "..."}: send fixed reply and stop.
+        - {"action": "skip"}: stop without reply.
+        """
+
+        hook_authorized = False
+        for result in hook_results or []:
+            if not isinstance(result, dict):
+                continue
+            action = str(result.get("action") or "").strip().lower()
+            if action == "allow":
+                hook_authorized = True
+                continue
+            if action in {"skip", "drop"}:
+                return hook_authorized, True
+            if action == "reply":
+                text = result.get("text") or result.get("content")
+                if isinstance(text, str) and text.strip():
+                    adapter = self.adapters.get(source.platform)
+                    if adapter:
+                        metadata = {"thread_id": source.thread_id} if source.thread_id else None
+                        await adapter.send(
+                            source.chat_id,
+                            text,
+                            reply_to=event.message_id,
+                            metadata=metadata,
+                        )
+                return hook_authorized, True
+        return hook_authorized, False
 
     def _resolve_session_agent_runtime(
         self,
@@ -3205,7 +3253,14 @@ class GatewayRunner:
         """
         source = event.source
 
-        await self._emit_message_observed(event, source)
+        observed_hook_results = await self._emit_message_observed(event, source)
+        hook_authorized, hook_handled = await self._apply_observed_hook_decisions(
+            event,
+            source,
+            observed_hook_results,
+        )
+        if hook_handled:
+            return None
 
         # Internal events (e.g. background-process completion notifications)
         # are system-generated and must skip user authorization.
@@ -3261,7 +3316,7 @@ class GatewayRunner:
             # flow with a None user_id.
             logger.debug("Ignoring message with no user_id from %s", source.platform.value)
             return None
-        elif not self._is_user_authorized(source):
+        elif not hook_authorized and not self._is_user_authorized(source):
             logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
             # In DMs: offer pairing code. In groups: silently ignore.
             if source.chat_type == "dm" and self._get_unauthorized_dm_behavior(source.platform) == "pair":
