@@ -1048,6 +1048,67 @@ class GatewayRunner:
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
         )
 
+    async def _emit_message_observed(self, event: MessageEvent, source: SessionSource) -> None:
+        """Emit a generic pre-auth inbound message observation hook."""
+        raw_message = getattr(event, "raw_message", None)
+        chat = getattr(raw_message, "chat", None)
+        user = getattr(raw_message, "from_user", None)
+
+        raw_chat_type = getattr(chat, "type", None) or getattr(source, "chat_type", None)
+        chat_type = getattr(raw_chat_type, "value", raw_chat_type)
+        message_type = getattr(event, "message_type", None)
+        message_type_value = getattr(message_type, "value", str(message_type or ""))
+        has_attachment = bool(
+            getattr(event, "media_urls", None)
+            or message_type_value in {"photo", "video", "audio", "voice", "document", "sticker"}
+        )
+        text = event.text or getattr(raw_message, "text", None) or getattr(raw_message, "caption", None) or ""
+
+        try:
+            from datetime import timezone
+
+            observed_at = datetime.now(timezone.utc).isoformat()
+        except Exception:
+            observed_at = datetime.utcnow().isoformat() + "Z"
+
+        try:
+            session_key = self._session_key_for_source(source)
+        except Exception:
+            session_key = None
+
+        payload = {
+            "event": "message_observed",
+            "timestamp": observed_at,
+            "platform": source.platform.value if source.platform else "",
+            "chat": {
+                "id": str(getattr(chat, "id", None) or source.chat_id or ""),
+                "name": source.chat_name,
+                "type": chat_type,
+            },
+            "sender": {
+                "id": str(getattr(user, "id", None) or source.user_id or ""),
+                "name": source.user_name,
+                "username": getattr(user, "username", None),
+                "first_name": getattr(user, "first_name", None),
+            },
+            "message_id": str(getattr(raw_message, "message_id", None) or event.message_id or ""),
+            "message_type": message_type_value,
+            "text": text,
+            "has_text": bool(text),
+            "has_attachment": has_attachment,
+            "session_key": session_key,
+            "emitted_before_authorization": True,
+        }
+
+        hooks = getattr(self, "hooks", None)
+        emit = getattr(hooks, "emit", None)
+        if not callable(emit):
+            return
+        try:
+            await emit("message:observed", payload)
+        except Exception as exc:
+            logger.debug("message:observed hook emit failed: %s", exc)
+
     def _resolve_session_agent_runtime(
         self,
         *,
@@ -3143,6 +3204,8 @@ class GatewayRunner:
         7. Return response
         """
         source = event.source
+
+        await self._emit_message_observed(event, source)
 
         # Internal events (e.g. background-process completion notifications)
         # are system-generated and must skip user authorization.
