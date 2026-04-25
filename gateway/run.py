@@ -10026,6 +10026,7 @@ class GatewayRunner:
                     chat_type=source.chat_type,
                     thread_id=source.thread_id,
                     gateway_session_key=session_key,
+                    message_id=event_message_id,
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
                 )
@@ -10045,6 +10046,15 @@ class GatewayRunner:
             agent.reasoning_config = reasoning_config
             agent.service_tier = self._service_tier
             agent.request_overrides = turn_route.get("request_overrides")
+            agent.platform = platform_key
+            agent._user_id = source.user_id
+            agent._user_name = source.user_name
+            agent._chat_id = source.chat_id
+            agent._chat_name = source.chat_name
+            agent._chat_type = source.chat_type
+            agent._thread_id = source.thread_id
+            agent._gateway_session_key = session_key
+            agent._message_id = event_message_id
 
             _bg_review_release = threading.Event()
             _bg_review_pending: list[str] = []

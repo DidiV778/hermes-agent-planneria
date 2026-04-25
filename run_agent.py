@@ -776,6 +776,7 @@ class AIAgent:
         chat_type: str = None,
         thread_id: str = None,
         gateway_session_key: str = None,
+        message_id: str = None,
         skip_context_files: bool = False,
         skip_memory: bool = False,
         session_db=None,
@@ -850,6 +851,7 @@ class AIAgent:
         self._chat_type = chat_type
         self._thread_id = thread_id
         self._gateway_session_key = gateway_session_key  # Stable per-chat key (e.g. agent:main:telegram:dm:123)
+        self._message_id = message_id
         # Pluggable print function — CLI replaces this with _cprint so that
         # raw ANSI status lines are routed through prompt_toolkit's renderer
         # instead of going directly to stdout where patch_stdout's StdoutProxy
@@ -7725,6 +7727,15 @@ class AIAgent:
             from hermes_cli.plugins import get_pre_tool_call_block_message
             block_message = get_pre_tool_call_block_message(
                 function_name, function_args, task_id=effective_task_id or "",
+                session_id=self.session_id or "",
+                tool_call_id=tool_call_id or "",
+                platform=self.platform or "",
+                user_id=self._user_id or "",
+                chat_id=self._chat_id or "",
+                chat_type=self._chat_type or "",
+                thread_id=self._thread_id or "",
+                session_key=self._gateway_session_key or "",
+                message_id=self._message_id or "",
             )
         except Exception:
             pass
@@ -7836,15 +7847,9 @@ class AIAgent:
             return
 
         # ── Parse args + pre-execution bookkeeping ───────────────────────
-        parsed_calls = []  # list of (tool_call, function_name, function_args)
+        parsed_calls = []  # list of (tool_call, function_name, function_args, block_message)
         for tool_call in tool_calls:
             function_name = tool_call.function.name
-
-            # Reset nudge counters
-            if function_name == "memory":
-                self._turns_since_memory = 0
-            elif function_name == "skill_manage":
-                self._iters_since_skill = 0
 
             try:
                 function_args = json.loads(tool_call.function.arguments)
@@ -7853,8 +7858,33 @@ class AIAgent:
             if not isinstance(function_args, dict):
                 function_args = {}
 
+            block_message: Optional[str] = None
+            try:
+                from hermes_cli.plugins import get_pre_tool_call_block_message
+                block_message = get_pre_tool_call_block_message(
+                    function_name, function_args, task_id=effective_task_id or "",
+                    session_id=self.session_id or "",
+                    tool_call_id=tool_call.id or "",
+                    platform=self.platform or "",
+                    user_id=self._user_id or "",
+                    chat_id=self._chat_id or "",
+                    chat_type=self._chat_type or "",
+                    thread_id=self._thread_id or "",
+                    session_key=self._gateway_session_key or "",
+                    message_id=self._message_id or "",
+                )
+            except Exception:
+                pass
+
+            if block_message is None:
+                # Reset nudge counters only when the relevant tool is actually allowed.
+                if function_name == "memory":
+                    self._turns_since_memory = 0
+                elif function_name == "skill_manage":
+                    self._iters_since_skill = 0
+
             # Checkpoint for file-mutating tools
-            if function_name in ("write_file", "patch") and self._checkpoint_mgr.enabled:
+            if block_message is None and function_name in ("write_file", "patch") and self._checkpoint_mgr.enabled:
                 try:
                     file_path = function_args.get("path", "")
                     if file_path:
@@ -7864,7 +7894,7 @@ class AIAgent:
                     pass
 
             # Checkpoint before destructive terminal commands
-            if function_name == "terminal" and self._checkpoint_mgr.enabled:
+            if block_message is None and function_name == "terminal" and self._checkpoint_mgr.enabled:
                 try:
                     cmd = function_args.get("command", "")
                     if _is_destructive_command(cmd):
@@ -7875,13 +7905,13 @@ class AIAgent:
                 except Exception:
                     pass
 
-            parsed_calls.append((tool_call, function_name, function_args))
+            parsed_calls.append((tool_call, function_name, function_args, block_message))
 
         # ── Logging / callbacks ──────────────────────────────────────────
-        tool_names_str = ", ".join(name for _, name, _ in parsed_calls)
+        tool_names_str = ", ".join(name for _, name, _, _ in parsed_calls)
         if not self.quiet_mode:
             print(f"  ⚡ Concurrent: {num_tools} tool calls — {tool_names_str}")
-            for i, (tc, name, args) in enumerate(parsed_calls, 1):
+            for i, (tc, name, args, block_message) in enumerate(parsed_calls, 1):
                 args_str = json.dumps(args, ensure_ascii=False)
                 if self.verbose_logging:
                     print(f"  📞 Tool {i}: {name}({list(args.keys())})")
@@ -7890,16 +7920,16 @@ class AIAgent:
                     args_preview = args_str[:self.log_prefix_chars] + "..." if len(args_str) > self.log_prefix_chars else args_str
                     print(f"  📞 Tool {i}: {name}({list(args.keys())}) - {args_preview}")
 
-        for tc, name, args in parsed_calls:
-            if self.tool_progress_callback:
+        for tc, name, args, block_message in parsed_calls:
+            if block_message is None and self.tool_progress_callback:
                 try:
                     preview = _build_tool_preview(name, args)
                     self.tool_progress_callback("tool.started", name, preview, args)
                 except Exception as cb_err:
                     logging.debug(f"Tool progress callback error: {cb_err}")
 
-        for tc, name, args in parsed_calls:
-            if self.tool_start_callback:
+        for tc, name, args, block_message in parsed_calls:
+            if block_message is None and self.tool_start_callback:
                 try:
                     self.tool_start_callback(tc.id, name, args)
                 except Exception as cb_err:
@@ -7914,7 +7944,7 @@ class AIAgent:
         self._current_tool = tool_names_str
         self._touch_activity(f"executing {num_tools} tools concurrently: {tool_names_str}")
 
-        def _run_tool(index, tool_call, function_name, function_args):
+        def _run_tool(index, tool_call, function_name, function_args, block_message):
             """Worker function executed in a thread."""
             # Register this worker tid so the agent can fan out an interrupt
             # to it — see AIAgent.interrupt().  Must happen first thing, and
@@ -7942,7 +7972,10 @@ class AIAgent:
                 pass
             start = time.time()
             try:
-                result = self._invoke_tool(function_name, function_args, effective_task_id, tool_call.id, messages=messages)
+                if block_message is not None:
+                    result = json.dumps({"error": block_message}, ensure_ascii=False)
+                else:
+                    result = self._invoke_tool(function_name, function_args, effective_task_id, tool_call.id, messages=messages)
             except Exception as tool_error:
                 result = f"Error executing tool '{function_name}': {tool_error}"
                 logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
@@ -7974,8 +8007,8 @@ class AIAgent:
             max_workers = min(num_tools, _MAX_TOOL_WORKERS)
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = []
-                for i, (tc, name, args) in enumerate(parsed_calls):
-                    f = executor.submit(_run_tool, i, tc, name, args)
+                for i, (tc, name, args, block_message) in enumerate(parsed_calls):
+                    f = executor.submit(_run_tool, i, tc, name, args, block_message)
                     futures.append(f)
 
                 # Wait for all to complete with periodic heartbeats so the
@@ -8032,7 +8065,7 @@ class AIAgent:
                 spinner.stop(f"⚡ {completed}/{num_tools} tools completed in {total_dur:.1f}s total")
 
         # ── Post-execution: display per-tool results ─────────────────────
-        for i, (tc, name, args) in enumerate(parsed_calls):
+        for i, (tc, name, args, block_message) in enumerate(parsed_calls):
             r = results[i]
             if r is None:
                 # Tool was cancelled (interrupt) or thread didn't return
@@ -8154,6 +8187,15 @@ class AIAgent:
                 from hermes_cli.plugins import get_pre_tool_call_block_message
                 _block_msg = get_pre_tool_call_block_message(
                     function_name, function_args, task_id=effective_task_id or "",
+                    session_id=self.session_id or "",
+                    tool_call_id=tool_call.id or "",
+                    platform=self.platform or "",
+                    user_id=self._user_id or "",
+                    chat_id=self._chat_id or "",
+                    chat_type=self._chat_type or "",
+                    thread_id=self._thread_id or "",
+                    session_key=self._gateway_session_key or "",
+                    message_id=self._message_id or "",
                 )
             except Exception:
                 pass
