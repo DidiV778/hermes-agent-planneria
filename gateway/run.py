@@ -499,6 +499,34 @@ def _load_gateway_config() -> dict:
     return {}
 
 
+def _config_bool(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value != 0
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    return default
+
+
+def _memory_flush_on_session_reset_enabled(config: dict | None = None) -> bool:
+    """Return whether gateway session-reset flush may write memory/skills."""
+
+    env_value = os.getenv("HERMES_MEMORY_FLUSH_ON_SESSION_RESET")
+    if env_value is not None and env_value.strip():
+        return _config_bool(env_value, default=True)
+
+    cfg = config if isinstance(config, dict) else _load_gateway_config()
+    memory_cfg = cfg.get("memory", {}) if isinstance(cfg.get("memory"), dict) else {}
+    return _config_bool(memory_cfg.get("flush_on_session_reset"), default=True)
+
+
 def _resolve_gateway_model(config: dict | None = None) -> str:
     """Read model from config.yaml — single source of truth.
 
@@ -909,6 +937,9 @@ class GatewayRunner:
         # conversation to extract memories from.
         if old_session_id and old_session_id.startswith("cron_"):
             logger.debug("Skipping memory flush for cron session: %s", old_session_id)
+            return
+        if not _memory_flush_on_session_reset_enabled():
+            logger.debug("Skipping memory flush for session %s: disabled by config", old_session_id)
             return
 
         try:
