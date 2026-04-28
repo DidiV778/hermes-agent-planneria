@@ -1188,6 +1188,88 @@ class GatewayRunner:
                 return hook_authorized, True
         return hook_authorized, False
 
+    async def _apply_before_send_hook(
+        self,
+        response: str,
+        *,
+        event: MessageEvent | None = None,
+        source: SessionSource,
+        session_id: str | None = None,
+        session_key: str | None = None,
+        agent_result: dict[str, Any] | None = None,
+        adapter_called: bool = False,
+    ) -> Optional[str]:
+        """Run mutable before-send hooks for a final gateway response.
+
+        Contract for hook return values:
+        - {"action": "allow"} / None: send the original response.
+        - {"action": "rewrite", "text": "..."}: send replacement text.
+        - {"action": "block", "safe_response": "..."}: send safe replacement.
+        - {"action": "block"}: suppress the send.
+
+        Hook registry failures are fail-safe for the gateway: the original
+        response is sent. Individual hook exceptions are already isolated by
+        HookRegistry.emit_collect().
+        """
+
+        if not isinstance(response, str) or not response:
+            return response
+
+        hooks = getattr(self, "hooks", None)
+        emit_collect = getattr(hooks, "emit_collect", None)
+        if not callable(emit_collect):
+            return response
+
+        context = {
+            "platform": source.platform.value if source.platform else "",
+            "chat_id": source.chat_id,
+            "user_id": source.user_id,
+            "message_id": getattr(event, "message_id", None) if event else None,
+            "session_id": session_id,
+            "session_key": session_key,
+            "final_response": response,
+            "adapter_called": bool(adapter_called),
+            "already_sent": bool((agent_result or {}).get("already_sent")),
+            "failed": bool((agent_result or {}).get("failed")),
+            "api_calls": (agent_result or {}).get("api_calls"),
+        }
+
+        try:
+            hook_results = await emit_collect("message:before_send", context)
+        except Exception as exc:
+            logger.warning("message:before_send hook invocation failed: %s", exc)
+            return response
+
+        for result in hook_results or []:
+            if not isinstance(result, dict):
+                continue
+            action = str(result.get("action") or "").strip().lower()
+            if action == "allow":
+                return response
+            if action == "rewrite":
+                replacement = (
+                    result.get("text")
+                    if "text" in result
+                    else result.get("content")
+                    if "content" in result
+                    else result.get("final_response")
+                )
+                if isinstance(replacement, str) and replacement.strip():
+                    return replacement
+                continue
+            if action == "block":
+                safe_response = (
+                    result.get("safe_response")
+                    if "safe_response" in result
+                    else result.get("text")
+                    if "text" in result
+                    else result.get("content")
+                )
+                if isinstance(safe_response, str) and safe_response.strip():
+                    return safe_response
+                return None
+        return response
+
     def _resolve_session_agent_runtime(
         self,
         *,
@@ -4838,6 +4920,22 @@ class GatewayRunner:
                     else:
                         display_reasoning = last_reasoning.strip()
                     response = f"💭 **Reasoning:**\n```\n{display_reasoning}\n```\n\n{response}"
+
+            adapter_called = any(
+                isinstance(msg, dict) and (msg.get("tool_calls") or msg.get("role") == "tool")
+                for msg in agent_messages
+            )
+            response = await self._apply_before_send_hook(
+                response,
+                event=event,
+                source=source,
+                session_id=session_entry.session_id,
+                session_key=session_key,
+                agent_result=agent_result,
+                adapter_called=adapter_called,
+            )
+            if response is None:
+                return None
 
             # Emit agent:end hook
             await self.hooks.emit("agent:end", {
@@ -10920,6 +11018,19 @@ class GatewayRunner:
                         or _previewed
                     )
                     first_response = result.get("final_response", "")
+                    if first_response and not _already_streamed:
+                        first_response = await self._apply_before_send_hook(
+                            first_response,
+                            source=source,
+                            session_id=session_id,
+                            session_key=session_key,
+                            agent_result=result,
+                            adapter_called=any(
+                                isinstance(msg, dict)
+                                and (msg.get("tool_calls") or msg.get("role") == "tool")
+                                for msg in (result.get("messages") or [])
+                            ),
+                        )
                     if first_response and not _already_streamed:
                         try:
                             logger.info(
